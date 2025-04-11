@@ -7,19 +7,16 @@ const { createClient } = require('@supabase/supabase-js');
 const axios = require('axios');
 const path = require('path');
 
-// Load environment variables from the root .env file
+// Load environment variables from .env file (from both local and parent directory)
+dotenv.config({ path: path.resolve(__dirname, '.env') });
 dotenv.config({ path: path.resolve(__dirname, '../.env') });
-console.log('Loading environment variables from:', path.resolve(__dirname, '../.env'));
+console.log('Loading environment variables from both .env locations');
 
 // Check if all needed environment variables are available at startup
 const checkEnvironmentVariables = () => {
   const requiredVars = [
     'SUPABASE_URL',
-    'SUPABASE_KEY',
-    'DEEPSEEK_KEY',
-    'NEWS_API_KEY',
-    'CRYPTOPANIC_KEY',
-    'ALPHA_VANTAGE_KEY'
+    'SUPABASE_KEY'
   ];
   
   const missingVars = requiredVars.filter(name => !process.env[name]);
@@ -40,11 +37,11 @@ const config = {
     url: process.env.SUPABASE_URL,
     key: process.env.SUPABASE_KEY
   },
-  deepseekKey: process.env.DEEPSEEK_KEY,
+  deepseekKey: process.env.DEEPSEEK_KEY || '',
   replicateKey: process.env.REPLICATE_KEY || '',
-  newsApiKey: process.env.NEWS_API_KEY,
-  cryptopanicKey: process.env.CRYPTOPANIC_KEY,
-  alphaVantageKey: process.env.ALPHA_VANTAGE_KEY
+  newsApiKey: process.env.NEWS_API_KEY || '',
+  cryptopanicKey: process.env.CRYPTOPANIC_KEY || '',
+  alphaVantageKey: process.env.ALPHA_VANTAGE_KEY || ''
 };
 
 // Initialize Supabase client with service role
@@ -78,7 +75,8 @@ const serviceRoleHeaders = {
 supabase.headers = serviceRoleHeaders.global.headers;
 
 const app = express();
-const port = 3001; // Using port 3001 consistently
+// Use process.env.PORT for hosting platforms like Glitch or fallback to 3005
+const port = process.env.PORT || 3005;
 
 // Add CORS support - enable for all origins during development
 app.use(cors({
@@ -105,7 +103,12 @@ app.use(express.json());
 
 // Test route
 app.get('/', (req, res) => {
-  res.json({ message: 'Fentrix.AI News API is running' });
+  res.json({ 
+    message: 'Fentrix.AI News API is running',
+    environment: process.env.NODE_ENV || 'development',
+    port: port,
+    time: new Date().toISOString()
+  });
 });
 
 // Meta information endpoint
@@ -1179,34 +1182,36 @@ async function processNews(force = false) {
 }
 
 // Start the server
-const PORT = process.env.PORT || 3005;
-app.listen(PORT, () => {
-  console.log(`Server running at http://localhost:${PORT}`);
-  
-  // Run the environment variable check
-  const envCheck = checkEnvironmentVariables();
-  if (!envCheck) {
-    console.warn("WARNING: Some environment variables are missing. The server may not function correctly.");
+const startServer = async () => {
+  try {
+    // Verify environment variables
+    checkEnvironmentVariables();
+    
+    app.listen(port, () => {
+      console.log(`✅ Server running at http://localhost:${port}`);
+      console.log(`📝 API documentation at http://localhost:${port}/meta.json`);
+      console.log(`🔄 Article update frequency: Every 4 hours (UTC)`);
+    });
+
+    // Initialize article lifecycle management
+    try {
+      await startArticleLifecycleManagement();
+    } catch (error) {
+      console.error('Failed to start article lifecycle management:', error);
+    }
+
+  } catch (error) {
+    console.error('Failed to start server:', error);
   }
-  
-  // Log Alpha Vantage API key status
-  console.log(`Alpha Vantage API key available: ${config.alphaVantageKey ? 'Yes' : 'No'}`);
-  console.log(`Environment loaded from: ${path.resolve(__dirname, '../.env')}`);
-  
-  // Initialize timer system
-  nextScheduledUpdateTime = calculateNextUpdateTime();
-  console.log(`Server started. Next update scheduled for: ${nextScheduledUpdateTime.toUTCString()}`);
-  
-  // Run an initial update when the server starts
-  console.log('Starting initial news fetch process...');
-  processNews(true).catch(err => {
-    console.error('Error during initial news fetch:', err);
+};
+
+// Start the server when this file is run directly
+if (require.main === module) {
+  startServer().catch(err => {
+    console.error('Failed to start server:', err);
+    process.exit(1);
   });
-  
-  // Start article lifecycle management
-  console.log('Starting article lifecycle management...');
-  startArticleLifecycleManagement();
-});
+}
 
 // Article lifecycle management - handles moving articles from active to archive to deletion
 async function startArticleLifecycleManagement() {
