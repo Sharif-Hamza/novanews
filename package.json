@@ -17,7 +17,7 @@
     "uuid": "^9.0.1"
   },
   "engines": {
-    "node": "16.x"
+    "node": ">=18.0.0"
   },
   "keywords": ["news", "api", "server"],
   "author": "",
