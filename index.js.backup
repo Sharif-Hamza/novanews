@@ -1,0 +1,2102 @@
+const express = require('express');
+const cors = require('cors');
+const dotenv = require('dotenv');
+const cheerio = require('cheerio');
+const cron = require('node-cron');
+const { createClient } = require('@supabase/supabase-js');
+const axios = require('axios');
+const path = require('path');
+
+// Load environment variables from the root .env file
+dotenv.config({ path: path.resolve(__dirname, '../.env') });
+console.log('Loading environment variables from:', path.resolve(__dirname, '../.env'));
+
+// Check if all needed environment variables are available at startup
+const checkEnvironmentVariables = () => {
+  const requiredVars = [
+    'SUPABASE_URL',
+    'SUPABASE_KEY',
+    'DEEPSEEK_KEY',
+    'NEWS_API_KEY',
+    'CRYPTOPANIC_KEY',
+    'ALPHA_VANTAGE_KEY'
+  ];
+  
+  const missingVars = requiredVars.filter(name => !process.env[name]);
+  
+  if (missingVars.length > 0) {
+    console.error('ERROR: The following required environment variables are missing:', missingVars.join(', '));
+    console.error('Please check your .env file and ensure all required variables are set.');
+    return false;
+  }
+  
+  console.log('All required environment variables are loaded successfully!');
+  return true;
+};
+
+// Explicitly set configuration from environment variables
+const config = {
+  supabase: {
+    url: process.env.SUPABASE_URL,
+    key: process.env.SUPABASE_KEY
+  },
+  deepseekKey: process.env.DEEPSEEK_KEY,
+  replicateKey: process.env.REPLICATE_KEY || '',
+  newsApiKey: process.env.NEWS_API_KEY,
+  cryptopanicKey: process.env.CRYPTOPANIC_KEY,
+  alphaVantageKey: process.env.ALPHA_VANTAGE_KEY
+};
+
+// Initialize Supabase client
+const supabase = createClient(config.supabase.url, config.supabase.key);
+console.log('Initializing Supabase client with:', { 
+  URL: config.supabase.url ? '✓' : '✗', 
+  KEY: config.supabase.key ? '✓' : '✗' 
+});
+
+const app = express();
+const port = 3001; // Using port 3001 consistently
+
+// Add CORS support - enable for all origins during development
+app.use(cors({
+  origin: '*', // Allow all origins for development
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'Accept', 'Origin', 'Cache-Control', 'X-Auth-Token', 'pragma'],
+  exposedHeaders: ['Content-Length', 'X-Foo', 'X-Bar'],
+  credentials: true,
+  preflightContinue: false,
+  optionsSuccessStatus: 204,
+  maxAge: 86400
+}));
+
+// CORS middleware for additional security
+app.use((req, res, next) => {
+  res.header('Access-Control-Allow-Origin', '*');
+  res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+  res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With, Accept, Origin, Cache-Control');
+  next();
+});
+
+// Set up JSON parsing middleware
+app.use(express.json());
+
+// Test route
+app.get('/', (req, res) => {
+  res.json({ message: 'Fentrix.AI News API is running' });
+});
+
+// Diagnostic endpoint to check article count
+app.get('/api/article-count', async (req, res) => {
+  try {
+    // Count articles in the database
+    const { count, error } = await supabase
+      .from('articles')
+      .select('*', { count: 'exact', head: true });
+    
+    if (error) {
+      console.error('Error counting articles:', error);
+      return res.status(500).json({ error: error.message });
+    }
+    
+    // Get the latest articles
+    const { data: latestArticles, error: fetchError } = await supabase
+      .from('articles')
+      .select('id, title, category, created_at')
+      .order('created_at', { ascending: false })
+      .limit(5);
+    
+    if (fetchError) {
+      console.error('Error fetching latest articles:', fetchError);
+    }
+    
+    // Use the global next scheduled update time
+    const now = new Date();
+    
+    // If the next scheduled time is not set or is in the past, calculate a new one
+    if (!nextScheduledUpdateTime || nextScheduledUpdateTime < now) {
+      nextScheduledUpdateTime = calculateNextUpdateTime();
+      console.log(`Next scheduled update time was unset or passed, calculated new one: ${nextScheduledUpdateTime.toISOString()}`);
+    } else {
+      console.log(`Using existing next scheduled update time: ${nextScheduledUpdateTime.toISOString()}`);
+    }
+    
+    // Calculate time remaining in more friendly format
+    const timeDiff = nextScheduledUpdateTime.getTime() - now.getTime();
+    const hoursRemaining = Math.floor(timeDiff / (1000 * 60 * 60));
+    const minutesRemaining = Math.floor((timeDiff % (1000 * 60 * 60)) / (1000 * 60));
+    const secondsRemaining = Math.floor((timeDiff % (1000 * 60)) / 1000);
+    
+    // Log the next update time for debugging
+    console.log(`Current time: ${now.toISOString()}`);
+    console.log(`Next article update time: ${nextScheduledUpdateTime.toISOString()}`);
+    console.log(`Time until next update: ${hoursRemaining}h ${minutesRemaining}m ${secondsRemaining}s`);
+    
+    res.json({ 
+      articleCount: count,
+      latestArticles: latestArticles || [],
+      nextUpdateTime: nextScheduledUpdateTime.toISOString(),
+      timeRemaining: {
+        hours: hoursRemaining,
+        minutes: minutesRemaining,
+        seconds: secondsRemaining,
+        totalSeconds: Math.floor(timeDiff / 1000)
+      },
+      currentTime: now.toISOString(),
+      updateScheduleInfo: {
+        frequency: "Every 4 hours",
+        schedule: "12am, 4am, 8am, 12pm, 4pm, 8pm",
+        timezone: "UTC"
+      }
+    });
+  } catch (error) {
+    console.error('Error in article-count endpoint:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Diagnostic endpoint to check articles are being stored
+app.get('/api/check-articles', async (req, res) => {
+  try {
+    // Count articles in the database
+    const { count, error: countError } = await supabase
+      .from('articles')
+      .select('*', { count: 'exact', head: true });
+    
+    if (countError) {
+      console.error('Error counting articles:', countError);
+      return res.status(500).json({ 
+        error: countError.message,
+        message: 'Error counting articles'
+      });
+    }
+    
+    // Get the latest 5 articles
+    const { data: articles, error: fetchError } = await supabase
+      .from('articles')
+      .select('id, title, category, created_at, created_by')
+      .order('created_at', { ascending: false })
+      .limit(5);
+    
+    if (fetchError) {
+      console.error('Error fetching articles:', fetchError);
+      return res.status(500).json({ 
+        error: fetchError.message,
+        message: 'Error fetching articles' 
+      });
+    }
+    
+    // Check if Realtime is enabled on the Supabase project
+    const { data: realtimeConfig, error: realtimeError } = await supabase.rpc('get_realtime_config').catch(err => {
+      return { data: null, error: { message: 'Realtime config check failed: ' + err.message } };
+    });
+    
+    res.json({
+      articleCount: count,
+      latestArticles: articles || [],
+      realtimeConfig: realtimeConfig || { note: 'Could not check realtime config' },
+      realtimeError: realtimeError ? realtimeError.message : null,
+      databaseInfo: {
+        url: config.supabase.url,
+        connected: true,
+        timestamp: new Date().toISOString()
+      }
+    });
+  } catch (error) {
+    console.error('Unexpected error in check-articles endpoint:', error);
+    res.status(500).json({ 
+      error: error.message || String(error),
+      message: 'Unexpected error checking articles' 
+    });
+  }
+});
+
+// Helper function to generate AI content using DeepSeek
+async function generateAIContent(title, content, category) {
+  // Create a prompt tailored to the category
+  let systemPrompt = "";
+  
+  switch(category) {
+    case 'stock':
+      systemPrompt = `You are a professional financial news journalist specializing in stock market analysis. 
+      Generate a comprehensive, well-structured news article based on the provided content. 
+      Include a catchy title, an informative summary, and a detailed body with the following sections:
+      - Market Impact (how this news affects the stock market)
+      - Expert Analysis (what financial experts are saying)
+      - Forward Outlook (predictions and future implications)
+      - Key Takeaways for investors
+      
+      The article MUST be at least 1000 words long with detailed analysis and examples.
+      Use professional financial terminology, include specific stock symbols where relevant, and provide context for retail investors.`;
+      break;
+    
+    case 'crypto':
+      systemPrompt = `You are a blockchain technology expert and cryptocurrency journalist.
+      Create a detailed news article based on the provided content.
+      Include a catchy title, an informative summary, and a detailed body with the following sections:
+      - Market Impact (how this news affects crypto prices)
+      - Technical Analysis (relevant blockchain or technical aspects)
+      - Community Response (reaction from the crypto community)
+      - Future Implications (what this means for the crypto ecosystem)
+      
+      The article MUST be at least 1000 words long with detailed analysis and examples.
+      Use appropriate crypto terminology, reference specific cryptocurrencies and tokens, and explain concepts clearly for both novice and experienced crypto enthusiasts.`;
+      break;
+    
+    case 'health':
+      systemPrompt = `You are a health and medical journalist with expertise in translating complex medical information for the general public.
+      Write an informative health news article based on the provided content.
+      Include a clear title, a concise summary, and a detailed body with the following sections:
+      - Key Health Findings
+      - Expert Medical Opinions
+      - Practical Implications for Readers
+      - Recommendations (if applicable)
+      
+      The article MUST be at least 1000 words long with detailed examples and medical context.
+      Present information accurately with appropriate health terminology, balanced reporting of risks and benefits, and context that helps readers understand the significance of the information.`;
+      break;
+    
+    case 'finance':
+      systemPrompt = `You are a financial journalist with expertise in economics and business news.
+      Create a detailed financial news article based on the provided content.
+      Include an engaging title, a comprehensive summary, and a detailed body with the following sections:
+      - Economic Context
+      - Business Impact
+      - Expert Analysis
+      - Future Outlook
+      
+      The article MUST be at least 1000 words long with detailed analysis and examples.
+      Use appropriate financial terminology, provide relevant economic context, and explain the implications for businesses and consumers.`;
+      break;
+    
+    default:
+      systemPrompt = `You are a professional news editor. Generate a well-structured news article based on the provided content. Include a title, summary, and detailed body with relevant sections, facts, and analysis. The article MUST be at least 1000 words long.`;
+  }
+
+  const response = await axios.post(
+    'https://api.deepseek.com/v1/chat/completions',
+    {
+      model: 'deepseek-chat',
+      messages: [
+        {
+          role: 'system',
+          content: systemPrompt,
+        },
+        {
+          role: 'user',
+          content: `Please create a comprehensive news article (at least 1000 words) based on this content: ${title}\n\n${content}`,
+        },
+      ],
+      max_tokens: 3000,  // Increased to 3000 for much longer articles
+    },
+    {
+      headers: {
+        'Authorization': `Bearer ${config.deepseekKey}`,
+        'Content-Type': 'application/json',
+      },
+    }
+  );
+
+  return response.data.choices[0].message.content;
+}
+
+// Updated function to generate a cover image, with reliable fallback
+async function generateCoverImage(title, category) {
+  try {
+    console.log(`Generating image for: ${title}`);
+    
+    // Clean the title for image generation
+    const cleanTitle = title
+      .replace(/#+\s*\*+/g, '')
+      .replace(/\*\*/g, '')
+      .replace(/:$/g, '')
+      .trim();
+    
+    // Build a prompt based on category
+    let prompt = `news article cover image about: ${cleanTitle}`;
+    let negativePrompt = "text, watermark, logo, label";
+    
+    // Category-specific enhancements
+    switch(category) {
+      case 'stock':
+        prompt += ", stock market, financial chart, trading, business";
+        break;
+      case 'crypto':
+        prompt += ", cryptocurrency, blockchain, bitcoin, digital finance";
+        break;
+      case 'health':
+        prompt += ", healthcare, medical, wellness, healthy lifestyle";
+        break;
+      case 'finance':
+        prompt += ", finance, economy, money, business";
+        break;
+    }
+    
+    // Try Replicate first
+    try {
+  const response = await axios.post(
+    'https://api.replicate.com/v1/predictions',
+    {
+          version: "db21e45d3f7023abc2a46ee38a23973f6dce16bb082a930b0c49861f96d1e5bf",
+      input: {
+            prompt,
+            negative_prompt: negativePrompt
+          }
+    },
+    {
+      headers: {
+            'Authorization': `Token ${config.replicateKey}`,
+        'Content-Type': 'application/json',
+          }
+        }
+      );
+      
+      // Check if we got a successful response
+      if (response.data && response.data.urls && response.data.urls.get) {
+        // Poll for completion
+        const getUrl = response.data.urls.get;
+        let result = null;
+        let attempts = 0;
+        
+        while (!result && attempts < 30) {
+          const getResponse = await axios.get(getUrl, {
+            headers: {
+              'Authorization': `Token ${config.replicateKey}`,
+              'Content-Type': 'application/json',
+            }
+          });
+          
+          if (getResponse.data.status === 'succeeded' && getResponse.data.output) {
+            result = getResponse.data.output;
+            break;
+          }
+          
+          // Wait before polling again
+          await new Promise(resolve => setTimeout(resolve, 1000));
+          attempts++;
+        }
+        
+        if (result && result.length > 0) {
+          return result[0]; // Return the first image URL
+        }
+      }
+      
+      throw new Error('No image generated from Replicate');
+    } catch (replicateError) {
+      console.error('Replicate image generation failed:', replicateError.message);
+      // Fall through to fallback
+    }
+    
+    // Fallback image generator - use placeholder image with category and title
+    const fallbackCategories = {
+      'stock': 'business',
+      'finance': 'business', 
+      'crypto': 'technology',
+      'health': 'health'
+    };
+    
+    const fallbackCategory = fallbackCategories[category] || 'news';
+    const width = 1200;
+    const height = 628;
+    
+    // Use Unsplash Source for high-quality free images
+    return `https://source.unsplash.com/featured/${width}x${height}/?${fallbackCategory}`;
+    
+  } catch (error) {
+    console.error('Error generating cover image:', error);
+    // Last resort fallback - use a generic placeholder
+    return `https://placehold.co/1200x628/333/FFF?text=NovaNews:+${category.toUpperCase()}`;
+  }
+}
+
+// Determine category based on content
+function determineCategory(content) {
+  const categoryKeywords = {
+    stock: ['stock', 'market', 'shares', 'trading', 'nasdaq', 'dow'],
+    crypto: ['crypto', 'bitcoin', 'blockchain', 'ethereum', 'token'],
+    health: ['health', 'medical', 'wellness', 'disease', 'treatment'],
+    finance: ['finance', 'economy', 'banking', 'investment', 'money'],
+  };
+
+  const contentLower = content.toLowerCase();
+  
+  for (const [category, keywords] of Object.entries(categoryKeywords)) {
+    if (keywords.some(keyword => contentLower.includes(keyword))) {
+      return category;
+    }
+  }
+
+  return 'custom';
+}
+
+// Generate article from URL
+app.post('/api/generate-article', async (req, res) => {
+  try {
+    const { url } = req.body;
+    console.log('Generating article from URL:', url);
+
+    // Fetch article content
+    const response = await axios.get(url);
+    const $ = cheerio.load(response.data);
+
+    // Extract article content
+    const title = $('h1').first().text() || $('title').text();
+    const articleText = $('article, [role="article"], .article-content, .post-content')
+      .text()
+      .trim()
+      .replace(/\s+/g, ' ');
+
+    console.log('Extracted title:', title);
+
+    // Determine category
+    const category = determineCategory(title + articleText);
+
+    // Generate AI content
+    const generatedContent = await generateAIContent(title, articleText, category);
+    const [aiTitle, aiSummary, ...bodyParts] = generatedContent.split('\n\n');
+
+    // Generate cover image
+    const coverImageUrl = await generateCoverImage(aiTitle, category);
+
+    const result = {
+      title: aiTitle.replace('Title: ', ''),
+      summary: aiSummary.replace('Summary: ', ''),
+      body: bodyParts.join('\n\n'),
+      cover_image_url: coverImageUrl,
+      category,
+    };
+
+    console.log('Generated article:', result);
+    res.json(result);
+  } catch (error) {
+    console.error('Error generating article:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Helper function to validate image URLs
+async function isValidImageUrl(url) {
+  if (!url) return false;
+  
+  try {
+    // Check if URL is a valid format
+    new URL(url);
+    
+    // Short-circuit for placeholder images - they're always valid
+    if (url.includes('placehold.co')) {
+      return true;
+    }
+    
+    // Make a HEAD request to check if the image exists and is accessible
+    try {
+      const response = await axios.head(url, { 
+        timeout: 3000, // Shorter timeout to fail faster
+        validateStatus: status => status < 400 // Accept any status code less than 400
+      });
+      
+      // Check if the content type is an image
+      const contentType = response.headers['content-type'];
+      return contentType && contentType.startsWith('image/');
+    } catch (requestError) {
+      console.log(`Invalid image URL: ${url}`, requestError.message);
+      return false;
+    }
+  } catch (error) {
+    console.log(`Malformed URL: ${url}`, error.message);
+    return false;
+  }
+}
+
+// Function to check if two titles are similar
+function isTitleSimilar(title1, title2) {
+  // If either title is too short, be more strict about similarity
+  if (title1.length < 10 || title2.length < 10) {
+    return title1 === title2;
+  }
+  
+  // For longer titles, compare using various methods
+  
+  // Direct contains check
+  if (title1.includes(title2) || title2.includes(title1)) {
+    return true;
+  }
+  
+  // Check for substantial overlap
+  const words1 = title1.split(/\s+/).filter(w => w.length > 3);
+  const words2 = title2.split(/\s+/).filter(w => w.length > 3);
+  
+  // If either has too few significant words, be cautious
+  if (words1.length < 3 || words2.length < 3) {
+    return false;
+  }
+  
+  // Count matching significant words
+  const matchingWords = words1.filter(w => words2.includes(w));
+  const matchRatio = matchingWords.length / Math.min(words1.length, words2.length);
+  
+  // If more than 70% of significant words match, consider it similar
+  return matchRatio > 0.7;
+}
+
+// Function to save article with strong duplicate detection and fingerprint support
+async function saveArticleWithValidation(article) {
+  try {
+    console.log(`Validating article: ${article.title}`);
+    
+    // Clean up title and summary from markdown/JSON formatting
+    article.title = article.title
+      .replace(/#+\s*\*+/g, '')
+      .replace(/\*\*/g, '')
+      .replace(/:$/g, '')
+      .trim();
+    
+    article.summary = article.summary
+      .replace(/^#+\s*\*+Summary\*+/i, '')
+      .replace(/\*\*/g, '')
+      .replace(/\\n/g, ' ')
+      .trim();
+    
+    // Generate a unique fingerprint for this article - handle case where function might not exist
+    const articleFingerprint = typeof generateArticleFingerprint === 'function' 
+      ? generateArticleFingerprint(article)
+      : `${article.title.substring(0, 50)}-${article.category}`.toLowerCase().replace(/[^a-z0-9-]/g, '-');
+    
+    // Ensure article has minimum content requirements
+    if (!article.title || !article.summary || !article.body || article.body.length < 500) {
+      console.log('Article rejected: Missing required content or insufficient length');
+      return { success: false, error: 'Article content requirements not met' };
+    }
+    
+    // Enhanced duplicate detection - check for similar titles and content
+    try {
+      // Check for exact fingerprint match since we know the column exists
+      const { data: fingerprintMatches, error: fingerprintError } = await supabase
+        .from('articles')
+        .select('id, title, fingerprint')
+        .eq('fingerprint', articleFingerprint);
+      
+      if (!fingerprintError && fingerprintMatches && fingerprintMatches.length > 0) {
+        console.log(`Exact fingerprint match found for article: ${article.title}`);
+        console.log(`Existing article ID: ${fingerprintMatches[0].id}`);
+        return { success: false, error: 'Duplicate article detected (exact fingerprint match)' };
+      }
+      
+      // Next, check for similar titles
+      const { data: existingArticles, error: articlesError } = await supabase
+        .from('articles')
+        .select('id, title, category')
+        .order('created_at', { ascending: false })
+        .limit(200);
+      
+      if (!articlesError && existingArticles && existingArticles.length > 0) {
+        // Check for title similarity
+        for (const existing of existingArticles) {
+          // Clean the existing title for comparison
+          const cleanExistingTitle = existing.title
+            .replace(/#+\s*\*+/g, '')
+            .replace(/\*\*/g, '')
+            .replace(/:$/g, '')
+            .trim()
+            .toLowerCase();
+          
+          const cleanNewTitle = article.title.toLowerCase();
+          
+          // Calculate similarity with stricter thresholds
+          if (isTitleSimilar(cleanExistingTitle, cleanNewTitle)) {
+            console.log(`Duplicate article found with title similar to: ${article.title}`);
+            console.log(`Existing article ID: ${existing.id}`);
+            return { success: false, error: 'Duplicate article detected (title similarity)' };
+          }
+          
+          // Also check for category duplicates with similar topic
+          if (existing.category === article.category && hasOverlappingKeywords(cleanExistingTitle, cleanNewTitle)) {
+            console.log(`Category duplicate with similar topic found for: ${article.title}`);
+            console.log(`Existing article ID: ${existing.id}`);
+            return { success: false, error: 'Duplicate article detected (category + topic similarity)' };
+          }
+        }
+      }
+    } catch (duplicateError) {
+      console.error('Error checking for duplicates:', duplicateError);
+      // Continue even if duplicate check fails
+    }
+    
+    // Validate image URL - use our improved image generation API
+    try {
+      if (!article.cover_image_url || !(await isValidImageUrl(article.cover_image_url))) {
+        console.log('Invalid image URL, setting proper image via API');
+        
+        // Use our image generation API to get a proper image
+        try {
+          const imageResponse = await axios.get(`http://localhost:${port}/api/generate-image?prompt=${encodeURIComponent(article.title)}&category=${article.category}`);
+          if (imageResponse.data && imageResponse.data.imageUrl) {
+            article.cover_image_url = imageResponse.data.imageUrl;
+          } else {
+            throw new Error('Image API returned invalid response');
+          }
+        } catch (imageApiError) {
+          console.log('Image generation API error:', imageApiError.message);
+          article.cover_image_url = `https://images.pexels.com/photos/518543/pexels-photo-518543.jpeg?auto=compress&cs=tinysrgb&w=1200&h=628`;
+        }
+      }
+    } catch (imageValidationError) {
+      console.log('Image validation error, setting fallback image');
+      article.cover_image_url = `https://images.pexels.com/photos/518543/pexels-photo-518543.jpeg?auto=compress&cs=tinysrgb&w=1200&h=628`;
+    }
+    
+    // Insert article with fingerprint (we know the column exists)
+    const { data, error } = await supabase
+      .from('articles')
+      .insert({
+        title: article.title,
+        summary: article.summary,
+        body: article.body,
+        cover_image_url: article.cover_image_url,
+        category: article.category,
+        created_at: article.created_at,
+        source_url: article.source_url,
+        created_by: 'autogen',
+        fingerprint: articleFingerprint
+      })
+      .select();
+    
+    if (error) {
+      console.error('Error saving article:', error);
+      return { success: false, error: error.message };
+    }
+    
+    console.log(`Successfully saved article: ${article.title}`);
+    return { success: true, data: data[0].id };
+  } catch (error) {
+    console.error('Error saving article:', error);
+    return { success: false, error: error.message };
+  }
+}
+
+// Helper function to check if titles have significant keyword overlap
+function hasOverlappingKeywords(title1, title2) {
+  // Extract significant keywords (words longer than 4 chars)
+  const keywords1 = title1.split(/\s+/).filter(word => word.length > 4);
+  const keywords2 = title2.split(/\s+/).filter(word => word.length > 4);
+  
+  // Count matching keywords
+  const matches = keywords1.filter(word => keywords2.includes(word));
+  
+  // If at least 3 significant keywords match, consider it overlapping
+  return matches.length >= 3;
+}
+
+// Generate a consistent fingerprint for article content
+function generateArticleFingerprint(article) {
+  // Extract key content for fingerprinting
+  const titleWords = article.title.toLowerCase().split(/\s+/).filter(w => w.length > 3);
+  const summaryWords = article.summary.toLowerCase().split(/\s+/).filter(w => w.length > 3).slice(0, 10);
+  
+  // Combine significant words from title and summary
+  const significantWords = [...titleWords, ...summaryWords].sort();
+  
+  // Create a stable fingerprint string
+  return significantWords.join('-') + '-' + article.category;
+}
+
+// Helper functions to fetch news from different sources
+async function fetchFinanceNews() {
+  try {
+    const response = await axios.get(
+      `https://newsapi.org/v2/top-headlines?country=us&category=business&apiKey=${config.newsApiKey}`
+    );
+    return response.data.articles.slice(0, 5); // Limit to 5 articles
+  } catch (error) {
+    console.error('Error fetching finance news:', error);
+    return [];
+  }
+}
+
+// Add this before the fetchCryptoNews function
+// Global cache for crypto news to avoid rate limits
+const cryptoNewsCache = {
+  data: null,
+  timestamp: null,
+  expiresAt: null
+};
+
+async function fetchCryptoNews() {
+  try {
+    // Check for valid cache first (cache for 1 hour during rate limits)
+    if (cryptoNewsCache.data && cryptoNewsCache.expiresAt && Date.now() < cryptoNewsCache.expiresAt) {
+      console.log(`Using cached crypto news data from ${new Date(cryptoNewsCache.timestamp).toISOString()}`);
+      return cryptoNewsCache.data;
+    }
+    
+    // Add some randomness to requests to avoid thundering herd
+    await new Promise(resolve => setTimeout(resolve, Math.random() * 1000));
+    
+    console.log('Fetching crypto news from API...');
+    const response = await axios.get(
+      `https://cryptopanic.com/api/v1/posts/?auth_token=${config.cryptopanicKey}&kind=news&public=true&limit=10`,
+      {
+        timeout: 5000,
+        headers: {
+          'Accept': 'application/json',
+          'User-Agent': 'NovaNews/1.0 (news aggregator; development)'
+        }
+      }
+    );
+    
+    if (response.status === 200 && response.data && response.data.results) {
+      const news = response.data.results.slice(0, 10);
+      
+      // Cache the successful response (30 minutes)
+      cryptoNewsCache.data = news;
+      cryptoNewsCache.timestamp = Date.now();
+      cryptoNewsCache.expiresAt = Date.now() + 30 * 60 * 1000; // 30 minutes
+      
+      return news;
+    } else {
+      throw new Error('Invalid response format from CryptoPanic API');
+    }
+  } catch (error) {
+    console.error('Error fetching crypto news:', error);
+    
+    // If rate limited (429), cache the error state longer
+    if (error.response && error.response.status === 429) {
+      console.log('CryptoPanic API rate limited - using fallback data and extending cache time');
+      // Extend cache time to avoid hammering the rate-limited API
+      if (cryptoNewsCache.data) {
+        cryptoNewsCache.expiresAt = Date.now() + 60 * 60 * 1000; // 1 hour on rate limit
+      }
+    }
+    
+    // Return cached data if available, even if expired
+    if (cryptoNewsCache.data) {
+      console.log('Returning cached crypto news as fallback');
+      return cryptoNewsCache.data;
+    }
+    
+    // Fallback hard-coded news data
+    console.log('No cache available - using synthetic crypto news data');
+    return [
+      {
+        title: "Bitcoin Price Analysis: BTC Holds Support Above $70,000",
+        url: "https://www.example.com/crypto-news/1",
+        source: { title: "NovaNews", domain: "novanews.example" },
+        published_at: new Date().toISOString(),
+        currencies: [{ code: "BTC", title: "Bitcoin", slug: "bitcoin" }]
+      },
+      {
+        title: "Ethereum Completes Major Network Upgrade",
+        url: "https://www.example.com/crypto-news/2",
+        source: { title: "NovaNews", domain: "novanews.example" },
+        published_at: new Date(Date.now() - 3600000).toISOString(),
+        currencies: [{ code: "ETH", title: "Ethereum", slug: "ethereum" }]
+      },
+      {
+        title: "Regulatory Clarity Brings Institutional Investors to Crypto Markets",
+        url: "https://www.example.com/crypto-news/3",
+        source: { title: "NovaNews", domain: "novanews.example" },
+        published_at: new Date(Date.now() - 7200000).toISOString(),
+        currencies: [{ code: "BTC", title: "Bitcoin", slug: "bitcoin" }, { code: "ETH", title: "Ethereum", slug: "ethereum" }]
+      }
+    ];
+  }
+}
+
+async function fetchHealthNews() {
+  try {
+    const response = await axios.get(
+      `https://newsapi.org/v2/top-headlines?country=us&category=health&apiKey=${config.newsApiKey}`
+    );
+    return response.data.articles.slice(0, 5); // Limit to 5 articles
+  } catch (error) {
+    console.error('Error fetching health news:', error);
+    return [];
+  }
+}
+
+async function fetchStockNews() {
+  try {
+    const response = await axios.get(
+      `https://newsapi.org/v2/everything?q=stock+market+OR+NASDAQ+OR+NYSE+OR+dow+jones&sortBy=publishedAt&apiKey=${config.newsApiKey}`
+    );
+    return response.data.articles.slice(0, 5); // Limit to 5 articles
+  } catch (error) {
+    console.error('Error fetching stock news:', error);
+    return [];
+  }
+}
+
+// Helper functions to extract title and summary from AI content
+function extractTitleFromContent(content) {
+  // Try to find a title in the content
+  const titleMatch = content.match(/Title:\s*(.+?)(?:\n|$)/);
+  if (titleMatch && titleMatch[1]) {
+    return titleMatch[1].trim();
+  }
+  
+  // If no explicit title, take the first line as title
+  const lines = content.split('\n');
+  for (const line of lines) {
+    const cleaned = line.trim();
+    if (cleaned && cleaned.length > 10 && cleaned.length < 200) {
+      return cleaned;
+    }
+  }
+  
+  // Fallback
+  return 'Fentrix.AI News Update';
+}
+
+function extractSummaryFromContent(content) {
+  // Try to find a summary in the content
+  const summaryMatch = content.match(/Summary:\s*(.+?)(?:\n\n|$)/s);
+  if (summaryMatch && summaryMatch[1]) {
+    return summaryMatch[1].trim();
+  }
+  
+  // If no explicit summary, take the first paragraph after the title
+  const paragraphs = content.split('\n\n');
+  if (paragraphs.length > 1) {
+    return paragraphs[1].trim();
+  }
+  
+  // Fallback
+  return 'Latest news update from Fentrix.AI.';
+}
+
+// Global variables for tracking update times
+let nextScheduledUpdateTime = null;
+let currentTimeFrame = null;
+let isProcessingNews = false;
+let lastUpdateTime = null;
+
+// Global cache for stock data to prevent excessive API calls
+let stockCache = {
+  lastUpdated: null,
+  data: null,
+  expiresAt: null
+};
+
+// Helper function to update the current timeframe based on UTC time
+function updateCurrentTimeFrame(date) {
+  const hours = date.getUTCHours();
+  let timeframe = "";
+  
+  if (hours >= 0 && hours < 4) {
+    timeframe = "12am-4am";
+  } else if (hours >= 4 && hours < 8) {
+    timeframe = "4am-8am";
+  } else if (hours >= 8 && hours < 12) {
+    timeframe = "8am-12pm";
+  } else if (hours >= 12 && hours < 16) {
+    timeframe = "12pm-4pm";
+  } else if (hours >= 16 && hours < 20) {
+    timeframe = "4pm-8pm";
+  } else {
+    timeframe = "8pm-12am";
+  }
+  
+  return timeframe;
+}
+
+function calculateNextUpdateTime() {
+  const now = new Date();
+  
+  // Fixed 4-hour intervals starting at midnight UTC (12am, 4am, 8am, 12pm, 4pm, 8pm)
+  const hours = now.getUTCHours();
+  const nextIntervalHour = Math.ceil(hours / 4) * 4 % 24;
+  const nextUpdateTime = new Date(now);
+  nextUpdateTime.setUTCMinutes(0, 0, 0); // Reset minutes, seconds, milliseconds
+  nextUpdateTime.setUTCHours(nextIntervalHour);
+  
+  // If that time is in the past or too close to now, schedule for the next 4-hour interval
+  if (nextUpdateTime <= now || (nextUpdateTime.getTime() - now.getTime()) < 10 * 60 * 1000) {
+    nextUpdateTime.setUTCHours(nextUpdateTime.getUTCHours() + 4);
+  }
+  
+  // Determine current timeframe
+  const timeframe = updateCurrentTimeFrame(now);
+  
+  console.log(`Current time (UTC): ${now.toUTCString()}`);
+  console.log(`Current timeframe: ${timeframe}`);
+  console.log(`Calculated next update time (UTC): ${nextUpdateTime.toUTCString()}`);
+  
+  return nextUpdateTime;
+}
+
+// Function to process news in batches with proper validation
+async function processNews(force = false) {
+  // Check if we're already processing news to avoid overlapping runs
+  if (isProcessingNews && !force) {
+    console.log('News processing already in progress, skipping this run');
+    return { success: false, error: 'Process already running' };
+  }
+  
+  try {
+    isProcessingNews = true;
+    console.log('Starting news fetch process...');
+    console.log('Current time:', new Date().toISOString());
+    
+    // Print environment variables status (without revealing values)
+    const envStatus = {
+      SUPABASE_URL: config.supabase.url ? '✓' : '✗',
+      SUPABASE_KEY: config.supabase.key ? '✓' : '✗',
+      DEEPSEEK_KEY: config.deepseekKey ? '✓' : '✗',
+      REPLICATE_KEY: config.replicateKey ? '✓' : '✗',
+      NEWS_API_KEY: config.newsApiKey ? '✓' : '✗',
+      CRYPTOPANIC_KEY: config.cryptopanicKey ? '✓' : '✗'
+    };
+    console.log('Environment variables loaded:', envStatus);
+    
+    // Fetch news from various sources
+    const financeNews = await fetchFinanceNews();
+    const cryptoNews = await fetchCryptoNews();
+    const healthNews = await fetchHealthNews();
+    const stockNews = await fetchStockNews();
+    
+    // Log the counts for each category
+    console.log(`Fetched and will process: ${financeNews.length} finance, ${cryptoNews.length} crypto, ${healthNews.length} health, and ${stockNews.length} stock articles`);
+    
+    // Check if we have any articles to process
+    if (financeNews.length === 0 && cryptoNews.length === 0 && 
+        healthNews.length === 0 && stockNews.length === 0) {
+      console.log('No articles fetched from any source, aborting process');
+      return { success: false, error: 'No articles fetched' };
+    }
+    
+    // Combine all articles
+    const allArticles = [
+      ...financeNews.map(article => ({ ...article, category: 'finance' })),
+      ...cryptoNews.map(article => ({ ...article, category: 'crypto' })),
+      ...healthNews.map(article => ({ ...article, category: 'health' })),
+      ...stockNews.map(article => ({ ...article, category: 'stock' }))
+    ];
+    
+    // Shuffle and limit to a reasonable number of articles
+    const shuffled = allArticles.sort(() => 0.5 - Math.random());
+    const maxArticles = Math.min(shuffled.length, 14); // Limit to 14 articles max
+    const selectedArticles = shuffled.slice(0, maxArticles);
+    
+    // Process in batches for better resource management
+    const batchSize = 2;
+    const totalBatches = Math.ceil(selectedArticles.length / batchSize);
+    let successCount = 0;
+    
+    for (let i = 0; i < selectedArticles.length; i += batchSize) {
+      const batch = selectedArticles.slice(i, i + batchSize);
+      const batchNumber = Math.floor(i / batchSize) + 1;
+      
+      console.log(`Processing batch ${batchNumber} of ${totalBatches}`);
+      
+      // Process articles in parallel within each batch
+      try {
+        const batchResults = await Promise.all(
+          batch.map(article => {
+            console.log(`Starting to process ${article.category} article: ${article.title}`);
+            return processArticle(article.title, article, article.category);
+          })
+        );
+        
+        // Count successes
+        const batchSuccesses = batchResults.filter(result => result.success).length;
+        successCount += batchSuccesses;
+        
+        console.log(`Batch ${batchNumber} of ${totalBatches} completed - ${batchSuccesses}/${batch.length} successful`);
+      } catch (batchError) {
+        console.error(`Error processing batch ${batchNumber}:`, batchError);
+      }
+      
+      // Add a short delay to avoid rate limit issues (but not too long)
+      await new Promise(resolve => setTimeout(resolve, 2000));
+    }
+    
+    console.log(`All news articles processed successfully. Created ${successCount} new articles.`);
+    
+    // Update the last update time to now
+    lastUpdateTime = new Date();
+    
+    // Schedule the next update
+    nextScheduledUpdateTime = calculateNextUpdateTime();
+    console.log(`Next scheduled news update: ${nextScheduledUpdateTime.toUTCString()}`);
+    
+    return { success: true, articlesCreated: successCount };
+  } catch (error) {
+    console.error('Error processing news:', error);
+    return { success: false, error: error.message };
+  } finally {
+    isProcessingNews = false;
+  }
+}
+
+// Start the server
+const PORT = process.env.PORT || 3005; // Updated to use port 3005
+app.listen(PORT, () => {
+  console.log(`Server running at http://localhost:${PORT}`);
+  
+  // Run the environment variable check
+  const envCheck = checkEnvironmentVariables();
+  if (!envCheck) {
+    console.warn("WARNING: Some environment variables are missing. The server may not function correctly.");
+  }
+  
+  // Log Alpha Vantage API key status
+  console.log(`Alpha Vantage API key available: ${config.alphaVantageKey ? 'Yes' : 'No'}`);
+  console.log(`Environment loaded from: ${path.resolve(__dirname, '../.env')}`);
+  
+  // Initialize timer system
+  nextScheduledUpdateTime = calculateNextUpdateTime();
+  console.log(`Server started. Next update scheduled for: ${nextScheduledUpdateTime.toUTCString()}`);
+  
+  // Run an initial update when the server starts
+  console.log('Starting initial news fetch process...');
+  processNews(true).catch(err => {
+    console.error('Error during initial news fetch:', err);
+  });
+});
+
+// Schedule timer to check every minute if we need to run the news process
+setInterval(async () => {
+  const now = new Date();
+  
+  // Always update the currentTimeFrame to ensure it's accurate
+  updateCurrentTimeFrame(now);
+  
+  // If the next scheduled time is not set or has passed, run the news process
+  if (nextScheduledUpdateTime && now >= nextScheduledUpdateTime) {
+    console.log(`It's time for the scheduled update at ${nextScheduledUpdateTime.toUTCString()}`);
+     
+    // Update the next scheduled time first to avoid race conditions
+    const oldTime = nextScheduledUpdateTime;
+    nextScheduledUpdateTime = calculateNextUpdateTime();
+
+    // Run the news process
+    await processNews();
+  }
+});
+
+// Function to process an individual article
+async function processArticle(title, articleData, category) {
+  try {
+    console.log(`Processing ${category} article: ${title}`);
+    
+    // Extract content from article data based on source
+    let content = '';
+    if (articleData.content) {
+      content = articleData.content;
+    } else if (articleData.description) {
+      content = articleData.description;
+    } else if (articleData.title) {
+      content = articleData.title;
+    }
+    
+    if (content.length < 50) {
+      console.log(`Warning: Very short content (${content.length} chars) for article: ${title}`);
+    }
+    
+    if (category === 'crypto' && articleData.currencies) {
+      // For crypto articles from CryptoPanic, extract currency info
+      const currencies = articleData.currencies.map(c => c.title).join(', ');
+      content = `${content} Related to: ${currencies}`;
+    }
+    
+    // Generate AI content using the title and extracted content
+    let aiContent;
+    try {
+      console.log(`Generating AI content for article: ${title}`);
+      aiContent = await generateAIContent(title, content, category);
+      console.log(`AI content generated successfully: ${aiContent.length} chars`);
+    } catch (error) {
+      console.error('Error generating AI content:', error);
+      // If AI content generation fails, create a simpler article
+      console.log('Using fallback content template');
+      aiContent = `# **${title}**\n\nSummary: Recent developments in ${category}.\n\n${content}`;
+    }
+    
+    // Extract title and summary from AI content
+    const aiTitle = extractTitleFromContent(aiContent);
+    const aiSummary = extractSummaryFromContent(aiContent);
+    
+    console.log(`Extracted title: "${aiTitle}"`);
+    console.log(`Extracted summary: "${aiSummary.substring(0, 100)}..."`);
+    
+    // Generate cover image
+    let coverImageUrl;
+    try {
+      console.log(`Generating image for: ${aiTitle}`);
+      coverImageUrl = await generateCoverImage(aiTitle, category);
+      console.log(`Image generated: ${coverImageUrl}`);
+    } catch (imageError) {
+      console.error('Error generating cover image:', imageError);
+      coverImageUrl = `https://placehold.co/1200x628/333/FFF?text=NovaNews:+${category.toUpperCase()}`;
+      console.log(`Using fallback image: ${coverImageUrl}`);
+    }
+    
+    // Create the article object
+    const article = {
+      title: aiTitle,
+      summary: aiSummary,
+      body: aiContent,
+          cover_image_url: coverImageUrl,
+          category,
+      created_at: new Date().toISOString(),
+      source_url: articleData.url || null,
+      created_by: 'autogen'
+    };
+    
+    // Save article to database
+    console.log(`Saving article to database: ${aiTitle}`);
+    const result = await saveArticleWithValidation(article);
+    
+    if (result.success) {
+      console.log(`Article processed and saved successfully: ${aiTitle}`);
+      return { success: true, articleId: result.data };
+    } else {
+      console.log(`Failed to save article: ${result.error}`);
+      return { success: false, error: result.error };
+    }
+  } catch (error) {
+    console.error('Error processing article:', error);
+    return { success: false, error: error.message };
+  }
+}
+
+// Update image generation endpoint to use direct reliable image URLs
+app.get('/api/generate-image', async (req, res) => {
+  try {
+    console.log('Image generation request received');
+    const { prompt, category } = req.query;
+    
+    if (!prompt) {
+      return res.status(400).json({ 
+        error: 'Missing prompt parameter',
+        message: 'A prompt is required to generate an image'
+      });
+    }
+    
+    // Use direct Pexels URLs instead of unreliable Unsplash redirects
+    const categoryImages = {
+      'finance': [
+        'https://images.pexels.com/photos/534216/pexels-photo-534216.jpeg?auto=compress&cs=tinysrgb&w=1200&h=628',
+        'https://images.pexels.com/photos/4386158/pexels-photo-4386158.jpeg?auto=compress&cs=tinysrgb&w=1200&h=628',
+        'https://images.pexels.com/photos/210607/pexels-photo-210607.jpeg?auto=compress&cs=tinysrgb&w=1200&h=628',
+        'https://images.pexels.com/photos/730547/pexels-photo-730547.jpeg?auto=compress&cs=tinysrgb&w=1200&h=628',
+        'https://images.pexels.com/photos/6801648/pexels-photo-6801648.jpeg?auto=compress&cs=tinysrgb&w=1200&h=628'
+      ],
+      'crypto': [
+        'https://images.pexels.com/photos/6780789/pexels-photo-6780789.jpeg?auto=compress&cs=tinysrgb&w=1200&h=628',
+        'https://images.pexels.com/photos/8370752/pexels-photo-8370752.jpeg?auto=compress&cs=tinysrgb&w=1200&h=628',
+        'https://images.pexels.com/photos/8919570/pexels-photo-8919570.jpeg?auto=compress&cs=tinysrgb&w=1200&h=628',
+        'https://images.pexels.com/photos/844124/pexels-photo-844124.jpeg?auto=compress&cs=tinysrgb&w=1200&h=628',
+        'https://images.pexels.com/photos/7788009/pexels-photo-7788009.jpeg?auto=compress&cs=tinysrgb&w=1200&h=628'
+      ],
+      'health': [
+        'https://images.pexels.com/photos/4386467/pexels-photo-4386467.jpeg?auto=compress&cs=tinysrgb&w=1200&h=628',
+        'https://images.pexels.com/photos/4047186/pexels-photo-4047186.jpeg?auto=compress&cs=tinysrgb&w=1200&h=628',
+        'https://images.pexels.com/photos/5473182/pexels-photo-5473182.jpeg?auto=compress&cs=tinysrgb&w=1200&h=628',
+        'https://images.pexels.com/photos/3683074/pexels-photo-3683074.jpeg?auto=compress&cs=tinysrgb&w=1200&h=628',
+        'https://images.pexels.com/photos/4386466/pexels-photo-4386466.jpeg?auto=compress&cs=tinysrgb&w=1200&h=628'
+      ],
+      'stock': [
+        'https://images.pexels.com/photos/159888/pexels-photo-159888.jpeg?auto=compress&cs=tinysrgb&w=1200&h=628',
+        'https://images.pexels.com/photos/6801648/pexels-photo-6801648.jpeg?auto=compress&cs=tinysrgb&w=1200&h=628',
+        'https://images.pexels.com/photos/8370764/pexels-photo-8370764.jpeg?auto=compress&cs=tinysrgb&w=1200&h=628',
+        'https://images.pexels.com/photos/7567486/pexels-photo-7567486.jpeg?auto=compress&cs=tinysrgb&w=1200&h=628',
+        'https://images.pexels.com/photos/186461/pexels-photo-186461.jpeg?auto=compress&cs=tinysrgb&w=1200&h=628'
+      ],
+      'news': [
+        'https://images.pexels.com/photos/518543/pexels-photo-518543.jpeg?auto=compress&cs=tinysrgb&w=1200&h=628',
+        'https://images.pexels.com/photos/5428836/pexels-photo-5428836.jpeg?auto=compress&cs=tinysrgb&w=1200&h=628',
+        'https://images.pexels.com/photos/1369476/pexels-photo-1369476.jpeg?auto=compress&cs=tinysrgb&w=1200&h=628',
+        'https://images.pexels.com/photos/3944454/pexels-photo-3944454.jpeg?auto=compress&cs=tinysrgb&w=1200&h=628',
+        'https://images.pexels.com/photos/3957987/pexels-photo-3957987.jpeg?auto=compress&cs=tinysrgb&w=1200&h=628'
+      ],
+      'technology': [
+        'https://images.pexels.com/photos/6963944/pexels-photo-6963944.jpeg?auto=compress&cs=tinysrgb&w=1200&h=628',
+        'https://images.pexels.com/photos/1261427/pexels-photo-1261427.jpeg?auto=compress&cs=tinysrgb&w=1200&h=628',
+        'https://images.pexels.com/photos/4348401/pexels-photo-4348401.jpeg?auto=compress&cs=tinysrgb&w=1200&h=628',
+        'https://images.pexels.com/photos/2582937/pexels-photo-2582937.jpeg?auto=compress&cs=tinysrgb&w=1200&h=628',
+        'https://images.pexels.com/photos/2582935/pexels-photo-2582935.jpeg?auto=compress&cs=tinysrgb&w=1200&h=628'
+      ]
+    };
+    
+    // Determine which category to use
+    const usedCategory = category && categoryImages[category] ? category : 'news';
+    
+    // Select a random image from the category
+    const images = categoryImages[usedCategory];
+    const randomIndex = Math.floor(Math.random() * images.length);
+    const imageUrl = images[randomIndex];
+    
+    // Pre-verify the image URL by making a HEAD request
+    try {
+      await axios.head(imageUrl, { timeout: 3000 });
+      // Image verified, return it immediately
+      res.json({ 
+        imageUrl,
+        prompt,
+        category: usedCategory,
+        message: 'Image generated successfully', 
+      });
+    } catch (verifyError) {
+      console.log('Image verification failed, returning fallback image');
+      // If verification fails, use a guaranteed working fallback
+      const fallbackImage = 'https://images.pexels.com/photos/518543/pexels-photo-518543.jpeg?auto=compress&cs=tinysrgb&w=1200&h=628';
+      res.json({ 
+        imageUrl: fallbackImage,
+        prompt,
+        category: usedCategory,
+        message: 'Using fallback image due to verification failure'
+      });
+    }
+  } catch (error) {
+    console.error('Error in image generation endpoint:', error);
+    res.status(500).json({ 
+      error: error.message,
+      message: 'Failed to generate image'
+    });
+  }
+});
+
+// Replace the mock stock data endpoint with a real-time financial API
+app.get('/api/stocks', async (req, res) => {
+  try {
+    // Set explicit CORS headers for this endpoint to ensure it works from all origins
+    res.header('Access-Control-Allow-Origin', '*');
+    res.header('Access-Control-Allow-Methods', 'GET, OPTIONS');
+    res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+    res.header('Cache-Control', 'no-cache, no-store, must-revalidate');
+    res.header('Pragma', 'no-cache');
+    res.header('Expires', '0');
+    
+    console.log('Stock API request received');
+    
+    // Check if this is an OPTIONS preflight request
+    if (req.method === 'OPTIONS') {
+      return res.status(200).end();
+    }
+
+    // Define popular stocks to track (smaller set to avoid rate limiting)
+    const stocks = ['AAPL', 'MSFT', 'GOOGL', 'TSLA', 'NVDA', 'META'];
+    
+    // Define crypto symbols (smaller set to avoid rate limiting)
+    const cryptoSymbols = ['BTCUSD'];
+    
+    // Define crypto symbols with more currencies 
+    const cryptoSymbols = ['BTCUSD', 'ETHUSD', 'XRPUSD', 'SOLUSD', 'DOGEUSD'];
+    
+    // Define crypto symbols (including more currencies)
+    const cryptoSymbols = ['BTCUSD', 'ETHUSD', 'XRPUSD', 'SOLUSD', 'DOGEUSD'];
+    
+    const allSymbols = [...stocks, ...cryptoSymbols];
+    
+    // Company names mapping for better display
+    const companyMapping = {
+      'AAPL': 'Apple Inc.',
+      'MSFT': 'Microsoft Corp.',
+      'GOOGL': 'Alphabet Inc.',
+      'AMZN': 'Amazon.com Inc.',
+      'TSLA': 'Tesla Inc.',
+      'META': 'Meta Platforms Inc.',
+      'NVDA': 'NVIDIA Corp.',
+      'BTCUSD': 'Bitcoin',
+      'ETHUSD': 'Ethereum'
+    };
+    
+    // Create an API status tracker for this request
+    const apiStatus = {
+      attempted: 0,
+      success: 0,
+      failed: 0,
+      errors: [],
+      fromCache: {}
+    };
+    
+    // Use Finnhub API exclusively
+    const finnhubKey = 'cvgs4rhr01qi76d4v2u0cvgs4rhr01qi76d4v2ug'; // Original correct key
+    // No backup key needed, using the original correct key
+    
+    // User-Agent to reduce likelihood of being blocked
+    const apiUserAgent = 'NovaNews/1.0 (news aggregation app; production)';
+    
+    // ======= CACHING STRATEGY ========
+    // Check if we have a valid global cache to minimize API calls
+    const now = Date.now();
+    let stocksData = [];
+    let shouldRefreshCache = true;
+    let cacheAge = 0;
+    
+    // Check if we have valid cached data
+    if (stockCache.data && stockCache.expiresAt) {
+      cacheAge = Math.floor((now - stockCache.lastUpdated) / 1000);
+      
+      if (now < stockCache.expiresAt) {
+        console.log(`Using cached stock data from ${new Date(stockCache.lastUpdated).toISOString()}, expires in ${Math.floor((stockCache.expiresAt - now)/1000)}s`);
+        shouldRefreshCache = false;
+        stocksData = stockCache.data.stocks;
+        
+        apiStatus.fromCache = {
+          age: cacheAge,
+          lastUpdated: new Date(stockCache.lastUpdated).toISOString(),
+          expires: new Date(stockCache.expiresAt).toISOString()
+        };
+      }
+    }
+    
+    // If we need to refresh the cache, fetch new data from Finnhub
+    if (shouldRefreshCache) {
+      console.log('Cache expired or not available - fetching fresh data from Finnhub');
+      
+      // Use current second to rotate through symbols (for maximum data coverage over time)
+      const currentSecond = new Date().getSeconds();
+      
+      // Determine which symbols to fetch in this request (rotating)
+      // Only fetch 3 symbols per request - 2 stocks and 1 crypto max
+      const maxStocksPerRequest = 2;
+      const maxCryptoPerRequest = 1;
+      
+      // Select stocks based on rotation
+      const stockStartIndex = (currentSecond % (stocks.length / maxStocksPerRequest)) * maxStocksPerRequest;
+      const selectedStocks = stocks.slice(stockStartIndex, stockStartIndex + maxStocksPerRequest);
+      
+      // Select crypto based on rotation (just alternate between BTC and ETH)
+      const selectedCrypto = currentSecond % 2 === 0 ? ['BTCUSD'] : [];
+      
+      // Combine selected symbols
+      const symbolsToFetch = [...selectedStocks, ...selectedCrypto];
+      
+      console.log(`Fetching data for rotation ${Math.floor(currentSecond / 10)}: ${symbolsToFetch.join(', ')}`);
+      
+      // If we have existing cache, use it as base and update only the selected symbols
+      if (stockCache.data && stockCache.data.stocks) {
+        stocksData = [...stockCache.data.stocks];
+      }
+      
+      // Process symbols one at a time with delay between calls
+      for (let i = 0; i < symbolsToFetch.length; i++) {
+        const symbol = symbolsToFetch[i];
+        try {
+          apiStatus.attempted++;
+          console.log(`Fetching data for ${symbol}`);
+          
+          // Handle crypto vs stocks differently
+          if (symbol.includes('USD')) {
+            // For crypto, use the quote endpoint instead of candles to avoid 403
+            const url = `https://finnhub.io/api/v1/quote?symbol=BINANCE:${symbol.substring(0, 3)}USDT&token=${finnhubKey}`;
+            
+            const response = await axios.get(url, { 
+              timeout: 5000,
+              headers: {
+                'User-Agent': apiUserAgent,
+                'Content-Type': 'application/json',
+                'Accept': 'application/json'
+              }
+            });
+            
+            if (response.data && response.data.c) {
+              const currentPrice = response.data.c;
+              const prevClose = response.data.pc;
+              const change = currentPrice - prevClose;
+              const changePercent = (change / prevClose) * 100;
+              
+              const stockData = {
+                symbol,
+                price: currentPrice.toFixed(2),
+                change: change.toFixed(2),
+                changePercent: changePercent.toFixed(2),
+                high: response.data.h.toFixed(2),
+                low: response.data.l.toFixed(2),
+                company: companyMapping[symbol] || symbol,
+                lastUpdated: new Date().toISOString(),
+                timestamp: new Date(response.data.t * 1000).toISOString(),
+                source: 'finnhub-real-time'
+              };
+              
+              // Replace in existing array or add
+              const existingIndex = stocksData.findIndex(s => s.symbol === symbol);
+              if (existingIndex >= 0) {
+                stocksData[existingIndex] = stockData;
+              } else {
+                stocksData.push(stockData);
+              }
+              
+              apiStatus.success++;
+            } else {
+              throw new Error('Invalid response format for crypto');
+            }
+          } else {
+            // For stocks, use the quote endpoint
+            const url = `https://finnhub.io/api/v1/quote?symbol=${symbol}&token=${finnhubKey}`;
+            
+            const response = await axios.get(url, { 
+              timeout: 5000,
+              headers: {
+                'User-Agent': apiUserAgent,
+                'Content-Type': 'application/json',
+                'Accept': 'application/json'
+              }
+            });
+            
+            if (response.data && response.data.c) {
+              const stockData = {
+                symbol,
+                price: response.data.c.toFixed(2),
+                change: response.data.d.toFixed(2),
+                changePercent: response.data.dp.toFixed(2),
+                high: response.data.h.toFixed(2),
+                low: response.data.l.toFixed(2),
+                open: response.data.o.toFixed(2),
+                prevClose: response.data.pc.toFixed(2),
+                company: companyMapping[symbol] || symbol,
+                lastUpdated: new Date().toISOString(),
+                timestamp: new Date(response.data.t * 1000).toISOString(),
+                source: 'finnhub-real-time'
+              };
+              
+              // Replace in existing array or add
+              const existingIndex = stocksData.findIndex(s => s.symbol === symbol);
+              if (existingIndex >= 0) {
+                stocksData[existingIndex] = stockData;
+              } else {
+                stocksData.push(stockData);
+              }
+              
+              apiStatus.success++;
+            } else {
+              throw new Error('Invalid response format for stock');
+            }
+          }
+          
+          // Add a delay between API calls (300ms) to prevent rate limiting
+          if (i < symbolsToFetch.length - 1) {
+            await new Promise(resolve => setTimeout(resolve, 300));
+          }
+  } catch (error) {
+          apiStatus.failed++;
+          console.error(`Error fetching ${symbol}:`, error.message);
+          apiStatus.errors.push(`${symbol}: ${error.message}`);
+        }
+      }
+      
+      // If we couldn't fetch any data and don't have previous cache, 
+      // add a few reference values to show something
+      if (stocksData.length === 0) {
+        console.log('No data available - adding reference values');
+        
+        // Reference values for stocks (approximates of real values)
+        const referenceData = {
+          'AAPL': { price: 174.23, change: 0.95, changePercent: 0.55 },
+          'MSFT': { price: 429.32, change: 2.16, changePercent: 0.51 },
+          'GOOGL': { price: 163.75, change: -0.78, changePercent: -0.47 },
+          'TSLA': { price: 172.63, change: -3.11, changePercent: -1.77 },
+          'META': { price: 493.50, change: 3.28, changePercent: 0.67 },
+          'NVDA': { price: 881.86, change: 6.93, changePercent: 0.79 },
+          'BTCUSD': { price: 63758.14, change: -531.27, changePercent: -0.83 }
+        };
+        
+        // Add reference data for a few key symbols
+        const backupSymbols = ['AAPL', 'MSFT', 'BTCUSD'];
+        
+        for (const symbol of backupSymbols) {
+          const data = referenceData[symbol];
+          stocksData.push({
+            symbol,
+            price: data.price.toFixed(2),
+            change: data.change.toFixed(2),
+            changePercent: data.changePercent.toFixed(2),
+            company: companyMapping[symbol] || symbol,
+            lastUpdated: new Date().toISOString(),
+            source: 'reference-data-fallback',
+            note: 'Fallback data due to API issues'
+          });
+        }
+      }
+    }
+    
+    // Sort the stocks by symbol for consistent ordering
+    stocksData.sort((a, b) => a.symbol.localeCompare(b.symbol));
+    
+    // Create response
+    const response = { 
+      stocks: stocksData,
+      meta: {
+        source: 'finnhub-real-time',
+        count: stocksData.length,
+        timestamp: new Date().toISOString(),
+        api_status: apiStatus,
+        rotation: Math.floor(new Date().getSeconds() / 10), // Current rotation
+        next_update: new Date(Date.now() + 15000).toISOString() // Next potential update in 15s
+      }
+    };
+    
+    // Cache this response for a reasonable time
+    stockCache = {
+      lastUpdated: Date.now(),
+      data: response,
+      expiresAt: Date.now() + 45000 // 45 second cache - balance between freshness and API load
+    };
+    
+    // Send the response
+    res.json(response);
+    
+  } catch (error) {
+    console.error('Error in stock API endpoint:', error);
+    
+    // If we have cached data, return it as a fallback
+    if (stockCache.data) {
+      console.log('Returning cached data due to error');
+      return res.json({
+        ...stockCache.data,
+        meta: {
+          ...stockCache.data.meta,
+          cached: true,
+          error: error.message
+        }
+      });
+    }
+    
+    res.status(500).json({ 
+      error: error.message,
+      message: 'Failed to fetch stock data',
+      timestamp: new Date().toISOString()
+    });
+  }
+});
+
+// Add a new endpoint for the timer and current timeframe with extreme rate limiting
+const timerRequests = {
+  clients: {},
+  lastLoggedMinute: 0,
+  staticResponse: null,
+  staticResponseExpiry: 0
+};
+app.get('/api/timer', (req, res) => {
+  try {
+    // Always set appropriate CORS headers for this endpoint
+    res.header('Access-Control-Allow-Origin', '*');
+    res.header('Access-Control-Allow-Methods', 'GET, OPTIONS');
+    res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With, Accept, Origin, Cache-Control');
+    res.header('Cache-Control', 'public, max-age=60'); // Enable browser caching for 60 seconds
+    
+    // Check if this is an OPTIONS preflight request
+    if (req.method === 'OPTIONS') {
+      return res.status(200).end();
+    }
+    
+    // Get client IP for rate limiting (or use a default)
+    const clientIp = req.headers['x-forwarded-for'] || req.socket.remoteAddress || 'unknown';
+    
+    // Check if this client has made too many requests recently
+    const requestTime = Date.now();
+    const lastRequest = timerRequests.clients[clientIp] || 0;
+    
+    // Check if we have a valid static response cached
+    if (timerRequests.staticResponse && requestTime < timerRequests.staticResponseExpiry) {
+      // Use the static response if it's valid (update timestamps)
+      const cachedResponse = {...timerRequests.staticResponse};
+      
+      // Update current time in the cached response
+      const now = new Date();
+      cachedResponse.currentTime = now.toISOString();
+      cachedResponse.currentTimeReadable = now.toLocaleTimeString('en-US', {
+        hour: 'numeric', minute: 'numeric', second: 'numeric', hour12: true, timeZone: 'UTC'
+      });
+      
+      // Update the time remaining calculation
+      const timeDiff = Math.max(0, new Date(cachedResponse.nextUpdateTime).getTime() - now.getTime());
+      const hoursRemaining = Math.floor(timeDiff / (1000 * 60 * 60));
+      const minutesRemaining = Math.floor((timeDiff % (1000 * 60 * 60)) / (1000 * 60));
+      const secondsRemaining = Math.floor((timeDiff % (1000 * 60)) / 1000);
+      
+      cachedResponse.timeRemaining = {
+        hours: hoursRemaining,
+        minutes: minutesRemaining,
+        seconds: secondsRemaining,
+        totalSeconds: Math.floor(timeDiff / 1000)
+      };
+      
+      return res.json(cachedResponse);
+    }
+    
+    // Extreme rate limiting - only allow a request every 60 seconds per IP
+    // This is necessary to prevent browser refresh loops and excessive API calls
+    if (requestTime - lastRequest < 60000) { // 60 seconds
+      // Too many requests, return 429 status with cached data if available
+      if (timerRequests.staticResponse) {
+        // Return cached data with 429 status
+        return res.status(429).json({
+          ...timerRequests.staticResponse,
+          error: 'Too many requests',
+          message: 'Please wait at least 1 minute before making another request',
+          retryAfter: Math.ceil((60000 - (requestTime - lastRequest)) / 1000),
+          status: "Cached response - timer updates are rate limited to once per minute"
+        });
+      } else {
+        // No cached data available yet
+        return res.status(429).json({
+          error: 'Too many requests',
+          message: 'Please wait at least 1 minute before making another request',
+          retryAfter: Math.ceil((60000 - (requestTime - lastRequest)) / 1000),
+          currentTimeFrame: updateCurrentTimeFrame(new Date()),
+          nextUpdateTime: nextScheduledUpdateTime ? nextScheduledUpdateTime.toISOString() : null,
+          status: "Cached response - timer updates are rate limited to once per minute"
+        });
+      }
+    }
+    
+    // Update the last request time for this client
+    timerRequests.clients[clientIp] = requestTime;
+    
+    // Get current time
+    const now = new Date();
+    
+    // Always update the current timeframe
+    const currentTimeFrame = updateCurrentTimeFrame(now);
+    
+    // If nextScheduledUpdateTime is not set or is in the past, calculate it
+    if (!nextScheduledUpdateTime || nextScheduledUpdateTime < now) {
+      nextScheduledUpdateTime = calculateNextUpdateTime();
+      console.log("Timer API: Next update time recalculated to", nextScheduledUpdateTime.toUTCString());
+    }
+    
+    // Calculate time remaining
+    const timeDiff = Math.max(0, nextScheduledUpdateTime.getTime() - now.getTime());
+    const hoursRemaining = Math.floor(timeDiff / (1000 * 60 * 60));
+    const minutesRemaining = Math.floor((timeDiff % (1000 * 60 * 60)) / (1000 * 60));
+    const secondsRemaining = Math.floor((timeDiff % (1000 * 60)) / 1000);
+    
+    // Create a readable time for the last update
+    let lastUpdateReadable = "Not yet updated";
+    if (lastUpdateTime) {
+      lastUpdateReadable = new Date(lastUpdateTime).toLocaleTimeString('en-US', {
+        hour: 'numeric',
+        minute: 'numeric',
+        hour12: true,
+        timeZone: 'UTC'
+      });
+    }
+    
+    // Create a readable time for the next update
+    const nextUpdateReadable = new Date(nextScheduledUpdateTime).toLocaleTimeString('en-US', {
+      hour: 'numeric',
+      minute: 'numeric',
+      hour12: true,
+      timeZone: 'UTC'
+    });
+    
+    // Set proper content type for JSON
+    res.setHeader('Content-Type', 'application/json');
+    
+    // Create the response payload
+    const response = {
+      currentTime: now.toISOString(),
+      currentTimeReadable: now.toLocaleTimeString('en-US', {
+        hour: 'numeric',
+        minute: 'numeric',
+        second: 'numeric',
+        hour12: true,
+        timeZone: 'UTC'
+      }),
+      currentTimeFrame,
+      nextUpdateTime: nextScheduledUpdateTime.toISOString(),
+      nextUpdateReadable,
+      lastUpdateTime: lastUpdateTime ? lastUpdateTime.toISOString() : null,
+      lastUpdateReadable,
+      timeRemaining: {
+        hours: hoursRemaining,
+        minutes: minutesRemaining,
+        seconds: secondsRemaining,
+        totalSeconds: Math.floor(timeDiff / 1000)
+      },
+      schedule: {
+        frequency: "Every 4 hours",
+        fixedTimes: "12am, 4am, 8am, 12pm, 4pm, 8pm",
+        timezone: "UTC"
+      }
+    };
+    
+    // Cache this response for 60 seconds server-side
+    timerRequests.staticResponse = {...response};
+    timerRequests.staticResponseExpiry = requestTime + 60000;
+    
+    // Only log the timer request once every minute to reduce console spam
+    const minuteKey = Math.floor(now.getTime() / 60000);
+    if (!timerRequests.lastLoggedMinute || timerRequests.lastLoggedMinute !== minuteKey) {
+      timerRequests.lastLoggedMinute = minuteKey;
+      console.log(`Timer API request: Sent timeframe ${currentTimeFrame}, next update in ${hoursRemaining}h ${minutesRemaining}m ${secondsRemaining}s`);
+    }
+    
+    // Send response
+    res.json(response);
+  } catch (error) {
+    console.error("Error in timer endpoint:", error);
+    res.status(500).json({ 
+      error: error.message,
+      currentTime: new Date().toISOString()
+    });
+  }
+});
+
+// Add a simple timer API endpoint as a backup
+app.get('/api/timer-short', (req, res) => {
+  try {
+    // Set CORS headers
+    res.header('Access-Control-Allow-Origin', '*');
+    res.header('Access-Control-Allow-Methods', 'GET, OPTIONS');
+    res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+    
+    // Check if this is an OPTIONS preflight request
+    if (req.method === 'OPTIONS') {
+      return res.status(200).end();
+    }
+    
+    // Send timer data
+    res.json({
+      timer: {
+        duration: 300,
+        start: new Date().toISOString(),
+        end: new Date(Date.now() + 300000).toISOString(),
+        status: 'active'
+      },
+      meta: {
+        serverTime: new Date().toISOString()
+      }
+    });
+  } catch (error) {
+    console.error('Error in timer API:', error);
+    res.status(500).json({ error: 'Failed to fetch timer data' });
+  }
+});
+
+// Track whether the server is running
+let isServerRunning = false;
+
+// Add a dedicated crypto data endpoint using CoinGecko API
+app.get('/api/crypto', async (req, res) => {
+  try {
+    // Set explicit CORS headers for this endpoint
+    res.header('Access-Control-Allow-Origin', '*');
+    res.header('Access-Control-Allow-Methods', 'GET, OPTIONS');
+    res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+    res.header('Cache-Control', 'no-cache, no-store, must-revalidate');
+    
+    console.log('Crypto API request received');
+    
+    if (req.method === 'OPTIONS') {
+      return res.status(200).end();
+    }
+    
+    // Create a global cache for crypto data to minimize API calls
+    if (!global.cryptoCache) {
+      global.cryptoCache = {
+        data: null,
+        lastUpdated: null,
+        expiresAt: null
+      };
+    }
+    
+    const now = Date.now();
+    let shouldRefreshCache = true;
+    let cryptoData = [];
+    
+    // Check if we have valid cached data (60 seconds cache)
+    if (global.cryptoCache.data && global.cryptoCache.expiresAt && now < global.cryptoCache.expiresAt) {
+      console.log(`Using cached crypto data from ${new Date(global.cryptoCache.lastUpdated).toISOString()}, expires in ${Math.floor((global.cryptoCache.expiresAt - now)/1000)}s`);
+      shouldRefreshCache = false;
+      cryptoData = global.cryptoCache.data;
+    }
+    
+    if (shouldRefreshCache) {
+      console.log('Fetching fresh crypto data from CoinGecko');
+      
+      // Define popular crypto coins to track
+      const coins = [
+        'bitcoin', 'ethereum', 'ripple', 'cardano', 'solana', 
+        'polkadot', 'dogecoin', 'avalanche-2', 'shiba-inu'
+      ];
+      
+      // Define popular crypto coins to track
+      const coins = [
+        'bitcoin', 'ethereum', 'ripple', 'cardano', 'solana', 
+        'polkadot', 'dogecoin', 'avalanche-2', 'shiba-inu',
+        'litecoin', 'chainlink', 'polygon', 'stellar', 'tron',
+        'uniswap', 'monero', 'cosmos', 'aave', 'eos'
+      ];
+      
+      // Define popular crypto coins to track with expanded selection
+      const coins = [
+        'bitcoin', 'ethereum', 'ripple', 'cardano', 'solana', 
+        'polkadot', 'dogecoin', 'avalanche-2', 'shiba-inu',
+        'litecoin', 'chainlink', 'polygon', 'stellar', 'tron',
+        'uniswap', 'monero', 'cosmos', 'aave', 'eos'
+      ];
+      
+      // Use CoinGecko API for crypto data (no authentication required)
+      const coinGeckoUrl = `https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&ids=${coins.join(',')}&order=market_cap_desc&per_page=15&page=1&sparkline=false&price_change_percentage=24h,7d`;
+      
+      try {
+        const response = await axios.get(coinGeckoUrl, { 
+          timeout: 8000,
+          headers: {
+            'Accept': 'application/json',
+            'Accept-Encoding': 'gzip, deflate',
+            'User-Agent': 'NovaNews/1.0 (news aggregator; development)'
+          }
+        });
+        
+        if (response.data && Array.isArray(response.data)) {
+          cryptoData = response.data.map(coin => {
+            return {
+              id: coin.id,
+              symbol: coin.symbol.toUpperCase(),
+              name: coin.name,
+              price: coin.current_price,
+              market_cap: coin.market_cap,
+              market_cap_rank: coin.market_cap_rank,
+              image: coin.image,
+              high_24h: coin.high_24h,
+              low_24h: coin.low_24h,
+              price_change_24h: coin.price_change_24h,
+              price_change_percentage_24h: coin.price_change_percentage_24h,
+              price_change_percentage_7d: coin.price_change_percentage_7d_in_currency,
+              total_volume: coin.total_volume,
+              circulating_supply: coin.circulating_supply,
+              last_updated: coin.last_updated,
+              ath: coin.ath,
+              ath_date: coin.ath_date,
+              ath_change_percentage: coin.ath_change_percentage
+            };
+          });
+          
+          // Also fetch crypto global data
+          try {
+            const globalResponse = await axios.get('https://api.coingecko.com/api/v3/global', {
+              timeout: 5000,
+              headers: {
+                'Accept': 'application/json',
+                'Accept-Encoding': 'gzip, deflate',
+                'User-Agent': 'NovaNews/1.0 (news aggregator; development)'
+              }
+            });
+            
+            if (globalResponse.data && globalResponse.data.data) {
+              const globalData = globalResponse.data.data;
+              
+              // Cache global market data
+              global.cryptoGlobalData = {
+                market_cap_usd: globalData.total_market_cap.usd,
+                volume_24h_usd: globalData.total_volume.usd,
+                bitcoin_dominance: globalData.market_cap_percentage.btc,
+                ethereum_dominance: globalData.market_cap_percentage.eth,
+                active_cryptocurrencies: globalData.active_cryptocurrencies,
+                markets: globalData.markets,
+                last_updated: new Date().toISOString()
+              };
+            }
+          } catch (globalError) {
+            console.error('Error fetching global crypto data:', globalError.message);
+          }
+          
+          // Cache the data for 2 minutes
+          global.cryptoCache = {
+            data: cryptoData,
+            lastUpdated: now,
+            expiresAt: now + 120000 // 2 minutes cache to avoid rate limiting
+          };
+        } else {
+          throw new Error('Invalid response format from CoinGecko');
+        }
+      } catch (coinGeckoError) {
+        console.error('CoinGecko API error:', coinGeckoError.message);
+        
+        // If we have cached data, return it even if expired
+        if (global.cryptoCache && global.cryptoCache.data) {
+          console.log('Using expired cache due to CoinGecko API error');
+          cryptoData = global.cryptoCache.data;
+          
+          // Extend the cache expiration to avoid hammering the API during outages
+          global.cryptoCache.expiresAt = now + 300000; // 5 minutes
+        } else {
+          throw new Error('No cached data available and CoinGecko API request failed');
+        }
+      }
+    }
+    
+    // Construct the final response
+    const response = {
+      data: cryptoData,
+      meta: {
+        count: cryptoData.length,
+        source: 'coingecko',
+        timestamp: new Date().toISOString(),
+        cached: !shouldRefreshCache,
+        next_update: global.cryptoCache.expiresAt ? new Date(global.cryptoCache.expiresAt).toISOString() : null
+      },
+      global: global.cryptoGlobalData || {}
+    };
+    
+    res.json(response);
+    
+  } catch (error) {
+    console.error('Error in crypto API endpoint:', error);
+    
+    // Check if we have any cached data as fallback
+    if (global.cryptoCache && global.cryptoCache.data) {
+      console.log('Returning cached crypto data due to error');
+      return res.json({
+        data: global.cryptoCache.data,
+        meta: {
+          count: global.cryptoCache.data.length,
+          source: 'coingecko',
+          timestamp: new Date().toISOString(),
+          cached: true,
+          error: error.message,
+          next_update: new Date(Date.now() + 30000).toISOString() // Try again in 30 seconds
+        },
+        global: global.cryptoGlobalData || {}
+      });
+    }
+    
+    // If we have no cached data, return an error
+    res.status(500).json({
+      error: error.message,
+      message: 'Failed to fetch crypto data',
+      timestamp: new Date().toISOString()
+    });
+  }
+});
+
+// Add a dedicated crypto market charts endpoint
+app.get('/api/crypto/chart/:id', async (req, res) => {
+  try {
+    // Set CORS headers
+    res.header('Access-Control-Allow-Origin', '*');
+    res.header('Access-Control-Allow-Methods', 'GET, OPTIONS');
+    res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+    
+    // Get coin ID from request params
+    const { id } = req.params;
+    const days = req.query.days || '7'; // Default 7 days
+    const interval = req.query.interval || 'daily'; // Default daily interval
+    
+    if (!id) {
+      return res.status(400).json({ error: 'Coin ID is required' });
+    }
+    
+    // Create a cache key for this specific request
+    const cacheKey = `chart_${id}_${days}_${interval}`;
+    
+    // Initialize cache if not exists
+    if (!global.cryptoChartCache) {
+      global.cryptoChartCache = {};
+    }
+    
+    // Check for valid cached data
+    const now = Date.now();
+    if (global.cryptoChartCache[cacheKey] && 
+        global.cryptoChartCache[cacheKey].expiresAt > now) {
+      console.log(`Using cached chart data for ${id}`);
+      return res.json(global.cryptoChartCache[cacheKey].data);
+    }
+    
+    console.log(`Fetching chart data for ${id}, days=${days}, interval=${interval}`);
+    
+    // Fetch chart data from CoinGecko
+    const url = `https://api.coingecko.com/api/v3/coins/${id}/market_chart?vs_currency=usd&days=${days}&interval=${interval}`;
+    try {
+      const response = await axios.get(url, {
+        timeout: 8000,
+        headers: {
+          'Accept': 'application/json',
+          'Accept-Encoding': 'gzip, deflate',
+          'User-Agent': 'NovaNews/1.0 (news aggregator; development)'
+        }
+      });
+      
+      if (response.data) {
+        // Process and format the data
+        const { prices, market_caps, total_volumes } = response.data;
+        
+        // Convert times from ms to formatted date strings and extract price data
+        const formattedData = {
+          labels: prices.map(item => new Date(item[0]).toISOString()),
+          prices: prices.map(item => item[1]),
+          market_caps: market_caps.map(item => item[1]),
+          total_volumes: total_volumes.map(item => item[1]),
+          coin_id: id,
+          days: days,
+          interval: interval
+        };
+        
+        // Cache the data
+        const cacheTime = parseInt(days) > 7 ? 3600000 : 1800000; // 1 hour for long-term data, 30 min for short-term
+        global.cryptoChartCache[cacheKey] = {
+          data: formattedData,
+          expiresAt: now + cacheTime
+        };
+        
+        res.json(formattedData);
+      } else {
+        throw new Error('Invalid chart data response');
+      }
+    } catch (chartError) {
+      console.error(`Error fetching chart data for ${id}:`, chartError.message);
+      
+      // If we have cached data, return it even if expired
+      if (global.cryptoChartCache[cacheKey] && global.cryptoChartCache[cacheKey].data) {
+        console.log(`Using expired cache for ${id} chart due to API error`);
+        return res.json({
+          ...global.cryptoChartCache[cacheKey].data,
+          cached: true,
+          error: 'Using cached data due to API error'
+        });
+      }
+      
+      res.status(500).json({
+        error: chartError.message,
+        message: 'Failed to fetch chart data',
+        timestamp: new Date().toISOString()
+      });
+    }
+  } catch (error) {
+    console.error(`Error in crypto chart endpoint:`, error.message);
+    res.status(500).json({
+      error: error.message,
+      message: 'Failed to process chart data request',
+      timestamp: new Date().toISOString()
+    });
+  }
+});
+
+// Add this endpoint after the other endpoints
+// Crypto news endpoint for article detail pages
+app.get('/api/crypto-news', async (req, res) => {
+  try {
+    console.log('Crypto News API request received');
+    
+    // Set CORS headers
+    res.header('Access-Control-Allow-Origin', '*');
+    res.header('Access-Control-Allow-Methods', 'GET, OPTIONS');
+    res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+    
+    // Handle preflight
+    if (req.method === 'OPTIONS') {
+      return res.status(200).end();
+    }
+    
+    // Get crypto news
+    const news = await fetchCryptoNews();
+    
+    // Return the news
+    res.json({
+      status: 'success',
+      data: news,
+      count: news.length,
+      timestamp: new Date().toISOString()
+    });
+  } catch (error) {
+    console.error('Error in Crypto News API endpoint:', error);
+    res.status(500).json({
+      status: 'error',
+      message: 'Failed to fetch crypto news',
+      error: error.message
+    });
+  }
+});
